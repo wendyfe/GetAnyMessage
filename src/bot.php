@@ -243,12 +243,25 @@ private function sendDownloadedMessageToChat(object $sourceClient, int|string $p
     }
 }
 
-private function buildUploadedInputMedia(array $media, string $path): ?array {
+private function editRelayStatus(int|string $peer, ?int $statusMessageId, string $message): void {
+    if ($statusMessageId === null) {
+        return;
+    }
+
+    try {
+        $this->messages->editMessage(peer: $peer, id: $statusMessageId, message: $message);
+    } catch (\Throwable $e) {}
+}
+
+private function buildUploadedInputMedia(array $media, string $path, ?callable $progressCallback = null): ?array {
+    $file = $progressCallback === null
+        ? new LocalFile($path)
+        : new FileCallback($path, $progressCallback);
     $mediaType = $media['_'] ?? '';
     if ($mediaType === 'messageMediaPhoto') {
         return [
             '_' => 'inputMediaUploadedPhoto',
-            'file' => new LocalFile($path),
+            'file' => $file,
         ];
     }
 
@@ -256,13 +269,99 @@ private function buildUploadedInputMedia(array $media, string $path): ?array {
         $document = $media['document'] ?? [];
         return [
             '_' => 'inputMediaUploadedDocument',
-            'file' => new LocalFile($path),
+            'file' => $file,
             'mime_type' => $document['mime_type'] ?? 'application/octet-stream',
             'attributes' => $document['attributes'] ?? [],
         ];
     }
 
     return null;
+}
+
+private function sendDownloadedAlbumToChat(object $sourceClient, int|string $peer, array $album, ?array $replyTo = null, ?int $statusMessageId = null): bool {
+    $mediaItems = array_values(array_filter($album, fn($item) => (($item['_'] ?? null) === 'message') && isset($item['media'])));
+    $total = count($mediaItems);
+    if ($total === 0) {
+        return false;
+    }
+
+    $dir = __DIR__ . '/data/_relay_uploads';
+    if (!is_dir($dir)) {
+        mkdir($dir, 0777, true);
+    }
+
+    $paths = [];
+    $multiMedia = [];
+    try {
+        foreach ($mediaItems as $index => $item) {
+            $position = $index + 1;
+            $media = $item['media'];
+            $info = $sourceClient->getDownloadInfo($media);
+            $extension = (string) ($info['ext'] ?? '');
+            if ($extension === '') {
+                $extension = '.bin';
+            }
+
+            $path = $dir . '/' . uniqid('album_', true) . $extension;
+            $paths[] = $path;
+            $lastDownloadUpdate = 0;
+            $this->editRelayStatus($peer, $statusMessageId, "Downloading media $position/$total...");
+            $sourceClient->downloadToFile(
+                $media,
+                new FileCallback(
+                    $path,
+                    function ($progress, $speed, $time) use ($peer, $statusMessageId, $position, $total, &$lastDownloadUpdate) {
+                        $now = time();
+                        if ($now - $lastDownloadUpdate >= 3 || $progress >= 100) {
+                            $lastDownloadUpdate = $now;
+                            $this->editRelayStatus($peer, $statusMessageId, "Downloading media $position/$total (" . number_format((float) $progress, 1) . "%)...");
+                        }
+                    }
+                )
+            );
+
+            $lastUploadUpdate = 0;
+            $inputMedia = $this->buildUploadedInputMedia(
+                $media,
+                $path,
+                function ($progress, $speed, $time) use ($peer, $statusMessageId, $position, $total, &$lastUploadUpdate) {
+                    $now = time();
+                    if ($now - $lastUploadUpdate >= 3 || $progress >= 100) {
+                        $lastUploadUpdate = $now;
+                        $this->editRelayStatus($peer, $statusMessageId, "Uploading media $position/$total (" . number_format((float) $progress, 1) . "%)...");
+                    }
+                }
+            );
+            if ($inputMedia === null) {
+                return false;
+            }
+
+            $multiMedia[] = [
+                '_' => 'inputSingleMedia',
+                'media' => $inputMedia,
+                'message' => (string) ($item['message'] ?? ''),
+                'entities' => $item['entities'] ?? [],
+            ];
+        }
+
+        $sent = 0;
+        $chunks = array_chunk($multiMedia, 10);
+        $chunkTotal = count($chunks);
+        foreach ($chunks as $chunkIndex => $chunk) {
+            $this->editRelayStatus($peer, $statusMessageId, 'Uploading album ' . ($chunkIndex + 1) . '/' . $chunkTotal . '...');
+            $this->messages->sendMultiMedia(peer: $peer, reply_to: $replyTo, multi_media: $chunk);
+            $sent += count($chunk);
+        }
+        return $sent > 0;
+    } catch (\Throwable $e) {
+        return false;
+    } finally {
+        foreach ($paths as $path) {
+            if (is_file($path)) {
+                @unlink($path);
+            }
+        }
+    }
 }
 
 private function tryFastSaveMessage(object $client, int|string $peer, array $item): bool {
@@ -310,7 +409,7 @@ private function tryReplyMessageToChat(int|string $peer, array $item, ?array $re
     }
 }
 
-private function tryReplyAlbumToChat(int|string $peer, array $album, ?array $replyTo = null, ?object $sourceClient = null): bool {
+private function tryReplyAlbumToChat(int|string $peer, array $album, ?array $replyTo = null, ?object $sourceClient = null, ?int $statusMessageId = null): bool {
     try {
         return $this->sendAlbumMessages($this, $peer, $album, $replyTo) > 0;
     } catch (\Throwable $e) {
@@ -318,13 +417,7 @@ private function tryReplyAlbumToChat(int|string $peer, array $album, ?array $rep
             return false;
         }
 
-        $sent = 0;
-        foreach ($album as $item) {
-            if ($this->tryReplyMessageToChat($peer, $item, $replyTo, $sourceClient)) {
-                $sent++;
-            }
-        }
-        return $sent > 0;
+        return $this->sendDownloadedAlbumToChat($sourceClient, $peer, $album, $replyTo, $statusMessageId);
     }
 }
 
@@ -2647,7 +2740,7 @@ $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, me
 
 if(count($albumMessages) > 1){
 $sentMessagex = $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "Processing album... Please wait.");
-if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto)){
+if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto, $this->extractMessageId($sentMessagex))){
 $this->messages->editMessage(peer: $senderid, id: $this->extractMessageId($sentMessagex), message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }
@@ -2699,7 +2792,7 @@ $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, me
 
 if(count($albumMessages) > 1){
 $sentMessagex = $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "Processing album... Please wait.");
-if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto)){
+if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto, $this->extractMessageId($sentMessagex))){
 $this->messages->editMessage(peer: $senderid, id: $this->extractMessageId($sentMessagex), message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }
@@ -6543,7 +6636,7 @@ $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, me
 
 if(count($albumMessages) > 1){
 $sentMessagex = $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "Processing album... Please wait.");
-if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto)){
+if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto, $this->extractMessageId($sentMessagex))){
 $this->messages->editMessage(peer: $senderid, id: $this->extractMessageId($sentMessagex), message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }
@@ -6707,7 +6800,7 @@ if($type != 'channel'){
 $albumMessages = $this->fetchAlbumMessages($MadelineProto, "$usernamex", $numbersx);
 if(count($albumMessages) > 1){
 $sentMessagex = $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "Processing album... Please wait.");
-if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto)){
+if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto, $this->extractMessageId($sentMessagex))){
 $this->messages->editMessage(peer: $senderid, id: $this->extractMessageId($sentMessagex), message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }

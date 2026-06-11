@@ -35,6 +35,11 @@ final class GetAnyMessage extends SimpleEventHandler
 
     public function getReportPeers(): array
     {
+        return [];
+    }
+
+    private function configuredAdmins(): array
+    {
         $env = $this->env();
         if (!isset($env['ADMIN'])) {
             return [];
@@ -277,7 +282,7 @@ final class GetAnyMessage extends SimpleEventHandler
 
     private function ensureAllowed(PrivateMessage $message): bool
     {
-        $admins = $this->getReportPeers();
+        $admins = $this->configuredAdmins();
         if ($admins === []) {
             return true;
         }
@@ -304,7 +309,7 @@ final class GetAnyMessage extends SimpleEventHandler
 
     private function sendMessageToAdminsSafe(string $message): void
     {
-        foreach ($this->getReportPeers() as $peer) {
+        foreach ($this->configuredAdmins() as $peer) {
             try {
                 $this->messages->sendMessage(peer: $peer, message: $message, parse_mode: ParseMode::HTML);
             } catch (\Throwable $e) {}
@@ -342,14 +347,14 @@ final class GetAnyMessage extends SimpleEventHandler
             return null;
         }
 
-        $state = json_decode((string) file_get_contents($path), true);
+        $state = json_decode(\Amp\File\read($path), true);
         return is_array($state) ? $state : null;
     }
 
     private function writeLoginState(int|string $senderId, array $state): void
     {
         $this->ensureUserDir($senderId);
-        file_put_contents($this->loginStatePath($senderId), json_encode($state, JSON_THROW_ON_ERROR));
+        \Amp\File\write($this->loginStatePath($senderId), json_encode($state, JSON_THROW_ON_ERROR));
     }
 
     private function clearLoginState(int|string $senderId): void

@@ -2,12 +2,15 @@
 
 declare(strict_types=1);
 
+final class RelayTaskCancelled extends \RuntimeException {}
+
 trait MessageRelay
 {
     private const RELAY_UNSUPPORTED_MESSAGE = "Unsupported format!\nFor all supported formats /help";
     private const RELAY_LOGIN_REQUIRED_MESSAGE = "<i>❌ To use this feature you need to log in with your own account.</i>";
     private const RELAY_DIRECT_FAIL_MESSAGE = "<i>❌ This message cannot be sent directly in bot chat.</i>";
     private const RELAY_ALBUM_FAIL_MESSAGE = "<i>❌ This album cannot be sent directly in bot chat.</i>";
+    private const RELAY_CANCELLED_MESSAGE = "Relay task cancelled.";
 
     private function parseTelegramMessageLink(string $url, object $sourceClient): ?array
     {
@@ -122,6 +125,7 @@ trait MessageRelay
 
         $requiresUserSession = (bool) ($target['requires_user_session'] ?? false);
         $relayClient = $requiresUserSession ? $sourceClient : $this;
+        $taskToken = null;
 
         try {
             $albumMessages = $this->fetchAlbumMessages($relayClient, (string) $target['peer'], (int) $target['message_id']);
@@ -137,9 +141,10 @@ trait MessageRelay
             }
 
             if (count($albumMessages) > 1) {
-                $status = $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: "Processing album... Please wait.");
-                $statusId = $this->extractMessageId($status);
-                if (!$this->tryReplyAlbumToChat($peer, $albumMessages, $replyTo, $relayClient, $statusId)) {
+                $status = $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: "Processing album... Please wait.\nSend /cancel_task to cancel.");
+                $statusId = $this->relayMessageId($status);
+                $taskToken = $this->startRelayTask($peer, $statusId, $url);
+                if (!$this->tryReplyAlbumToChat($peer, $albumMessages, $replyTo, $relayClient, $statusId, $taskToken)) {
                     $this->editRelayStatus($peer, $statusId, self::RELAY_ALBUM_FAIL_MESSAGE);
                     return true;
                 }
@@ -150,11 +155,12 @@ trait MessageRelay
 
             $statusId = null;
             if (isset($firstMessage['media'])) {
-                $status = $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: "Processing media... Please wait.");
-                $statusId = $this->extractMessageId($status);
+                $status = $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: "Processing media... Please wait.\nSend /cancel_task to cancel.");
+                $statusId = $this->relayMessageId($status);
+                $taskToken = $this->startRelayTask($peer, $statusId, $url);
             }
 
-            if (!$this->tryReplyMessageToChat($peer, $firstMessage, $replyTo, $relayClient, $statusId)) {
+            if (!$this->tryReplyMessageToChat($peer, $firstMessage, $replyTo, $relayClient, $statusId, $taskToken)) {
                 if ($statusId !== null) {
                     $this->editRelayStatus($peer, $statusId, self::RELAY_DIRECT_FAIL_MESSAGE);
                 } else {
@@ -165,9 +171,16 @@ trait MessageRelay
 
             $this->deleteRelayStatus($statusId);
             return true;
+        } catch (RelayTaskCancelled $e) {
+            $this->editRelayStatus($peer, $this->activeRelayStatusId($peer), self::RELAY_CANCELLED_MESSAGE);
+            return true;
         } catch (\Throwable $e) {
             $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: '<i>❌ ' . $e->getMessage() . '</i>', parse_mode: 'HTML');
             return true;
+        } finally {
+            if ($taskToken !== null) {
+                $this->clearActiveRelayTask($peer, $taskToken);
+            }
         }
     }
 
@@ -271,7 +284,7 @@ trait MessageRelay
         return $sent;
     }
 
-    private function sendDownloadedMessageToChat(object $sourceClient, int|string $peer, array $item, ?array $replyTo = null, ?int $statusMessageId = null): bool
+    private function sendDownloadedMessageToChat(object $sourceClient, int|string $peer, array $item, ?array $replyTo = null, ?int $statusMessageId = null, ?string $taskToken = null): bool
     {
         if (($item['_'] ?? null) !== 'message' || !isset($item['media'])) {
             return false;
@@ -285,30 +298,34 @@ trait MessageRelay
             $path = $this->prepareRelayUploadDir() . '/' . uniqid('relay_', true) . ($extension === '' ? '.bin' : $extension);
 
             $lastDownloadUpdate = 0;
+            $this->throwIfRelayTaskCancelled($peer, $taskToken);
             $this->editRelayStatus($peer, $statusMessageId, 'Downloading media...');
             $sourceClient->downloadToFile(
                 $media,
                 new \danog\MadelineProto\FileCallback(
                     $path,
-                    function ($progress, $speed, $time) use ($peer, $statusMessageId, &$lastDownloadUpdate) {
+                    function ($progress, $speed, $time) use ($peer, $statusMessageId, $taskToken, &$lastDownloadUpdate) {
+                        $this->throwIfRelayTaskCancelled($peer, $taskToken);
                         $now = time();
                         if ($now - $lastDownloadUpdate >= 3 || $progress >= 100) {
                             $lastDownloadUpdate = $now;
-                            $this->editRelayStatus($peer, $statusMessageId, 'Downloading media (' . number_format((float) $progress, 1) . '%)...');
+                            $this->editRelayStatus($peer, $statusMessageId, 'Downloading media (' . number_format((float) $progress, 1) . "%)...\nSend /cancel_task to cancel.");
                         }
                     }
                 )
             );
 
+            $this->throwIfRelayTaskCancelled($peer, $taskToken);
             $lastUploadUpdate = 0;
             $inputMedia = $this->buildUploadedInputMedia(
                 $media,
                 $path,
-                function ($progress, $speed, $time) use ($peer, $statusMessageId, &$lastUploadUpdate) {
+                function ($progress, $speed, $time) use ($peer, $statusMessageId, $taskToken, &$lastUploadUpdate) {
+                    $this->throwIfRelayTaskCancelled($peer, $taskToken);
                     $now = time();
                     if ($now - $lastUploadUpdate >= 3 || $progress >= 100) {
                         $lastUploadUpdate = $now;
-                        $this->editRelayStatus($peer, $statusMessageId, 'Uploading media (' . number_format((float) $progress, 1) . '%)...');
+                        $this->editRelayStatus($peer, $statusMessageId, 'Uploading media (' . number_format((float) $progress, 1) . "%)...\nSend /cancel_task to cancel.");
                     }
                 }
             );
@@ -316,6 +333,7 @@ trait MessageRelay
                 return false;
             }
 
+            $this->throwIfRelayTaskCancelled($peer, $taskToken);
             $this->messages->sendMedia(
                 peer: $peer,
                 reply_to: $replyTo,
@@ -324,6 +342,8 @@ trait MessageRelay
                 media: $inputMedia
             );
             return true;
+        } catch (RelayTaskCancelled $e) {
+            throw $e;
         } catch (\Throwable $e) {
             return false;
         } finally {
@@ -395,7 +415,100 @@ trait MessageRelay
         return null;
     }
 
-    private function sendDownloadedAlbumToChat(object $sourceClient, int|string $peer, array $album, ?array $replyTo = null, ?int $statusMessageId = null): bool
+    private function relayMessageId(mixed $message): ?int
+    {
+        if (is_array($message)) {
+            return isset($message['id']) ? (int) $message['id'] : null;
+        }
+
+        if (is_object($message) && isset($message->id)) {
+            return (int) $message->id;
+        }
+
+        return null;
+    }
+
+    private function relayTaskPath(int|string $peer): string
+    {
+        return __DIR__ . "/data/$peer/active_relay_task.json";
+    }
+
+    private function startRelayTask(int|string $peer, ?int $statusMessageId, string $url): string
+    {
+        $dir = __DIR__ . "/data/$peer";
+        if (!is_dir($dir)) {
+            mkdir($dir, 0777, true);
+        }
+
+        $token = bin2hex(random_bytes(12));
+        file_put_contents(
+            $this->relayTaskPath($peer),
+            json_encode([
+                'token' => $token,
+                'status_message_id' => $statusMessageId,
+                'url' => $url,
+                'cancelled' => false,
+                'started_at' => time(),
+            ], JSON_THROW_ON_ERROR)
+        );
+
+        return $token;
+    }
+
+    private function readActiveRelayTask(int|string $peer): ?array
+    {
+        $path = $this->relayTaskPath($peer);
+        if (!is_file($path)) {
+            return null;
+        }
+
+        $state = json_decode((string) file_get_contents($path), true);
+        return is_array($state) ? $state : null;
+    }
+
+    private function activeRelayStatusId(int|string $peer): ?int
+    {
+        $state = $this->readActiveRelayTask($peer);
+        return isset($state['status_message_id']) ? (int) $state['status_message_id'] : null;
+    }
+
+    private function cancelActiveRelayTask(int|string $peer): bool
+    {
+        $state = $this->readActiveRelayTask($peer);
+        if ($state === null) {
+            return false;
+        }
+
+        $state['cancelled'] = true;
+        $state['cancelled_at'] = time();
+        file_put_contents($this->relayTaskPath($peer), json_encode($state, JSON_THROW_ON_ERROR));
+        $this->editRelayStatus($peer, $this->activeRelayStatusId($peer), 'Cancelling relay task...');
+        return true;
+    }
+
+    private function clearActiveRelayTask(int|string $peer, string $token): void
+    {
+        $state = $this->readActiveRelayTask($peer);
+        if (($state['token'] ?? null) !== $token) {
+            return;
+        }
+
+        @unlink($this->relayTaskPath($peer));
+    }
+
+    private function throwIfRelayTaskCancelled(int|string $peer, ?string $token): void
+    {
+        if ($token === null) {
+            return;
+        }
+
+        $state = $this->readActiveRelayTask($peer);
+        if (($state['token'] ?? null) === $token && !empty($state['cancelled'])) {
+            throw new RelayTaskCancelled();
+        }
+    }
+
+    private function sendDownloadedAlbumToChat(object $sourceClient, int|string $peer, array $album, ?array $replyTo = null, ?int $statusMessageId = null, ?string $taskToken = null): bool
     {
         $mediaItems = array_values(array_filter($album, fn($item) => (($item['_'] ?? null) === 'message') && isset($item['media'])));
         $total = count($mediaItems);
@@ -415,30 +528,34 @@ trait MessageRelay
                 $paths[] = $path;
 
                 $lastDownloadUpdate = 0;
+                $this->throwIfRelayTaskCancelled($peer, $taskToken);
                 $this->editRelayStatus($peer, $statusMessageId, "Downloading media $position/$total...");
                 $sourceClient->downloadToFile(
                     $media,
                     new \danog\MadelineProto\FileCallback(
                         $path,
-                        function ($progress, $speed, $time) use ($peer, $statusMessageId, $position, $total, &$lastDownloadUpdate) {
+                        function ($progress, $speed, $time) use ($peer, $statusMessageId, $position, $total, $taskToken, &$lastDownloadUpdate) {
+                            $this->throwIfRelayTaskCancelled($peer, $taskToken);
                             $now = time();
                             if ($now - $lastDownloadUpdate >= 3 || $progress >= 100) {
                                 $lastDownloadUpdate = $now;
-                                $this->editRelayStatus($peer, $statusMessageId, "Downloading media $position/$total (" . number_format((float) $progress, 1) . "%)...");
+                                $this->editRelayStatus($peer, $statusMessageId, "Downloading media $position/$total (" . number_format((float) $progress, 1) . "%)...\nSend /cancel_task to cancel.");
                             }
                         }
                     )
                 );
 
+                $this->throwIfRelayTaskCancelled($peer, $taskToken);
                 $lastUploadUpdate = 0;
                 $inputMedia = $this->buildUploadedInputMedia(
                     $media,
                     $path,
-                    function ($progress, $speed, $time) use ($peer, $statusMessageId, $position, $total, &$lastUploadUpdate) {
+                    function ($progress, $speed, $time) use ($peer, $statusMessageId, $position, $total, $taskToken, &$lastUploadUpdate) {
+                        $this->throwIfRelayTaskCancelled($peer, $taskToken);
                         $now = time();
                         if ($now - $lastUploadUpdate >= 3 || $progress >= 100) {
                             $lastUploadUpdate = $now;
-                            $this->editRelayStatus($peer, $statusMessageId, "Uploading media $position/$total (" . number_format((float) $progress, 1) . "%)...");
+                            $this->editRelayStatus($peer, $statusMessageId, "Uploading media $position/$total (" . number_format((float) $progress, 1) . "%)...\nSend /cancel_task to cancel.");
                         }
                     }
                 );
@@ -458,11 +575,14 @@ trait MessageRelay
             $chunks = array_chunk($multiMedia, 10);
             $chunkTotal = count($chunks);
             foreach ($chunks as $chunkIndex => $chunk) {
+                $this->throwIfRelayTaskCancelled($peer, $taskToken);
                 $this->editRelayStatus($peer, $statusMessageId, 'Uploading album ' . ($chunkIndex + 1) . '/' . $chunkTotal . '...');
                 $this->messages->sendMultiMedia(peer: $peer, reply_to: $replyTo, multi_media: $chunk);
                 $sent += count($chunk);
             }
             return $sent > 0;
+        } catch (RelayTaskCancelled $e) {
+            throw $e;
         } catch (\Throwable $e) {
             return false;
         } finally {
@@ -474,13 +594,14 @@ trait MessageRelay
         }
     }
 
-    private function tryReplyMessageToChat(int|string $peer, array $item, ?array $replyTo = null, ?object $sourceClient = null, ?int $statusMessageId = null): bool
+    private function tryReplyMessageToChat(int|string $peer, array $item, ?array $replyTo = null, ?object $sourceClient = null, ?int $statusMessageId = null, ?string $taskToken = null): bool
     {
         if (($item['_'] ?? null) !== 'message') {
             return false;
         }
 
         try {
+            $this->throwIfRelayTaskCancelled($peer, $taskToken);
             $text = (string) ($item['message'] ?? '');
             $entities = $item['entities'] ?? null;
             $media = $item['media'] ?? null;
@@ -490,24 +611,29 @@ trait MessageRelay
                 $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: $text, entities: $entities);
             }
             return true;
+        } catch (RelayTaskCancelled $e) {
+            throw $e;
         } catch (\Throwable $e) {
             if ($sourceClient !== null && isset($media)) {
-                return $this->sendDownloadedMessageToChat($sourceClient, $peer, $item, $replyTo, $statusMessageId);
+                return $this->sendDownloadedMessageToChat($sourceClient, $peer, $item, $replyTo, $statusMessageId, $taskToken);
             }
             return false;
         }
     }
 
-    private function tryReplyAlbumToChat(int|string $peer, array $album, ?array $replyTo = null, ?object $sourceClient = null, ?int $statusMessageId = null): bool
+    private function tryReplyAlbumToChat(int|string $peer, array $album, ?array $replyTo = null, ?object $sourceClient = null, ?int $statusMessageId = null, ?string $taskToken = null): bool
     {
         try {
+            $this->throwIfRelayTaskCancelled($peer, $taskToken);
             return $this->sendAlbumMessages($this, $peer, $album, $replyTo) > 0;
+        } catch (RelayTaskCancelled $e) {
+            throw $e;
         } catch (\Throwable $e) {
             if ($sourceClient === null) {
                 return false;
             }
 
-            return $this->sendDownloadedAlbumToChat($sourceClient, $peer, $album, $replyTo, $statusMessageId);
+            return $this->sendDownloadedAlbumToChat($sourceClient, $peer, $album, $replyTo, $statusMessageId, $taskToken);
         }
     }
 }

@@ -80,7 +80,7 @@ final class GetAnyMessage extends SimpleEventHandler
 
         $this->messages->sendMessage(
             peer: $message->senderId,
-            message: "Supported links:\nhttps://t.me/channel/123\nhttps://t.me/c/1234567890/123\nhttps://t.me/c/1234567890/topic/123\n\nPrivate/internal links need /login first.",
+            message: "Supported links:\nhttps://t.me/channel/123\nhttps://t.me/c/1234567890/123\nhttps://t.me/c/1234567890/topic/123\n\nPrivate/internal links need /login first.\nUse /cancel_task to stop the current relay task.",
             no_webpage: true,
         );
     }
@@ -136,6 +136,21 @@ final class GetAnyMessage extends SimpleEventHandler
 
         $this->clearLoginState($message->senderId);
         $this->messages->sendMessage(peer: $message->senderId, message: "Cancelled.");
+    }
+
+    #[FilterCommandCaseInsensitive('cancel_task')]
+    public function cancelTaskCommand(Incoming&PrivateMessage&IsNotEdited $message): void
+    {
+        if (!$this->ensureAllowed($message)) {
+            return;
+        }
+
+        if ($this->cancelActiveRelayTask($message->senderId)) {
+            $this->messages->sendMessage(peer: $message->senderId, message: "Cancelling the current relay task...");
+            return;
+        }
+
+        $this->messages->sendMessage(peer: $message->senderId, message: "No active relay task.");
     }
 
     #[FilterCommandCaseInsensitive('logout')]

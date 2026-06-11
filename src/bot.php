@@ -214,10 +214,7 @@ private function sendDownloadedMessageToChat(object $sourceClient, int|string $p
             $extension = '.bin';
         }
 
-        $dir = __DIR__ . '/data/_relay_uploads';
-        if (!is_dir($dir)) {
-            mkdir($dir, 0777, true);
-        }
+        $dir = $this->prepareRelayUploadDir();
 
         $path = $dir . '/' . uniqid('relay_', true) . $extension;
         $sourceClient->downloadToFile($media, $path);
@@ -253,6 +250,22 @@ private function editRelayStatus(int|string $peer, ?int $statusMessageId, string
     } catch (\Throwable $e) {}
 }
 
+private function prepareRelayUploadDir(): string {
+    $dir = __DIR__ . '/data/_relay_uploads';
+    if (!is_dir($dir)) {
+        mkdir($dir, 0777, true);
+    }
+
+    $expireBefore = time() - 86400;
+    foreach (glob($dir . '/*') ?: [] as $path) {
+        if (is_file($path) && filemtime($path) !== false && filemtime($path) < $expireBefore) {
+            @unlink($path);
+        }
+    }
+
+    return $dir;
+}
+
 private function buildUploadedInputMedia(array $media, string $path, ?callable $progressCallback = null): ?array {
     $file = $progressCallback === null
         ? new LocalFile($path)
@@ -285,10 +298,7 @@ private function sendDownloadedAlbumToChat(object $sourceClient, int|string $pee
         return false;
     }
 
-    $dir = __DIR__ . '/data/_relay_uploads';
-    if (!is_dir($dir)) {
-        mkdir($dir, 0777, true);
-    }
+    $dir = $this->prepareRelayUploadDir();
 
     $paths = [];
     $multiMedia = [];

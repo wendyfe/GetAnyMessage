@@ -59,11 +59,31 @@ trait MessageRelay
             ];
         }
 
+        $peer = preg_match('/^\d+$/', $segments[0]) ? $segments[0] : '@' . $segments[0];
+
         return [
-            'peer' => preg_match('/^\d+$/', $segments[0]) ? $segments[0] : '@' . $segments[0],
+            'peer' => $peer,
             'message_id' => (int) $messageId,
-            'requires_user_session' => count($segments) > 2,
+            'requires_user_session' => count($segments) > 2 || $this->publicPeerRequiresUserSession($sourceClient, $peer),
         ];
+    }
+
+    private function publicPeerRequiresUserSession(object $sourceClient, string $peer): bool
+    {
+        if (!str_starts_with($peer, '@')) {
+            return false;
+        }
+
+        try {
+            $info = $sourceClient->getInfo($peer);
+            $type = $info['type'] ?? null;
+            $chat = $info['Chat'] ?? [];
+            return in_array($type, ['chat', 'supergroup'], true)
+                || !empty($chat['megagroup'])
+                || !empty($chat['gigagroup']);
+        } catch (\Throwable $e) {
+            return false;
+        }
     }
 
     private function resolveInternalTelegramPeer(object $sourceClient, string $internalId): string

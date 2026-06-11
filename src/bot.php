@@ -106,7 +106,7 @@ public function getReportPeers(): array {
 
 private function fetchAlbumMessages(object $client, string $channel, int|string $messageId): array {
     $messageId = (int) $messageId;
-    $messages = $client->channels->getMessages(channel: $channel, id: [$messageId]);
+    $messages = $this->fetchMessagesFromPeer($client, $channel, [$messageId]);
     $first = $messages['messages'][0] ?? null;
     $groupedId = $first['grouped_id'] ?? $first['groupedId'] ?? null;
     if (!$groupedId) {
@@ -114,7 +114,7 @@ private function fetchAlbumMessages(object $client, string $channel, int|string 
     }
 
     $ids = range(max(1, $messageId - 10), $messageId + 10);
-    $nearby = $client->channels->getMessages(channel: $channel, id: $ids);
+    $nearby = $this->fetchMessagesFromPeer($client, $channel, $ids);
     $album = [];
     foreach (($nearby['messages'] ?? []) as $item) {
         $itemGroupedId = $item['grouped_id'] ?? $item['groupedId'] ?? null;
@@ -125,6 +125,14 @@ private function fetchAlbumMessages(object $client, string $channel, int|string 
 
     usort($album, fn($a, $b) => ((int) ($a['id'] ?? 0)) <=> ((int) ($b['id'] ?? 0)));
     return $album ?: [$first];
+}
+
+private function fetchMessagesFromPeer(object $client, string $peer, array $ids): array {
+    try {
+        return $client->channels->getMessages(channel: $peer, id: $ids);
+    } catch (\Throwable $e) {
+        return $client->messages->getMessages(id: $ids);
+    }
 }
 
 private function sendAlbumMessages(object $client, int|string $peer, array $album, ?array $replyTo = null): int {
@@ -187,6 +195,76 @@ private function sendAlbumMessages(object $client, int|string $peer, array $albu
     return $sent;
 }
 
+private function sendDownloadedMessageToChat(object $sourceClient, int|string $peer, array $item, ?array $replyTo = null): bool {
+    if (($item['_'] ?? null) !== 'message') {
+        return false;
+    }
+
+    $media = $item['media'] ?? null;
+    if ($media === null) {
+        return false;
+    }
+
+    $inputMedia = null;
+    $path = null;
+    try {
+        $info = $sourceClient->getDownloadInfo($media);
+        $extension = (string) ($info['ext'] ?? '');
+        if ($extension === '') {
+            $extension = '.bin';
+        }
+
+        $dir = __DIR__ . '/data/_relay_uploads';
+        if (!is_dir($dir)) {
+            mkdir($dir, 0777, true);
+        }
+
+        $path = $dir . '/' . uniqid('relay_', true) . $extension;
+        $sourceClient->downloadToFile($media, $path);
+        $inputMedia = $this->buildUploadedInputMedia($media, $path);
+        if ($inputMedia === null) {
+            return false;
+        }
+
+        $this->messages->sendMedia(
+            peer: $peer,
+            reply_to: $replyTo,
+            message: (string) ($item['message'] ?? ''),
+            entities: $item['entities'] ?? null,
+            media: $inputMedia
+        );
+        return true;
+    } catch (\Throwable $e) {
+        return false;
+    } finally {
+        if ($path !== null && is_file($path)) {
+            @unlink($path);
+        }
+    }
+}
+
+private function buildUploadedInputMedia(array $media, string $path): ?array {
+    $mediaType = $media['_'] ?? '';
+    if ($mediaType === 'messageMediaPhoto') {
+        return [
+            '_' => 'inputMediaUploadedPhoto',
+            'file' => new LocalFile($path),
+        ];
+    }
+
+    if ($mediaType === 'messageMediaDocument') {
+        $document = $media['document'] ?? [];
+        return [
+            '_' => 'inputMediaUploadedDocument',
+            'file' => new LocalFile($path),
+            'mime_type' => $document['mime_type'] ?? 'application/octet-stream',
+            'attributes' => $document['attributes'] ?? [],
+        ];
+    }
+
+    return null;
+}
+
 private function tryFastSaveMessage(object $client, int|string $peer, array $item): bool {
     if (($item['_'] ?? null) !== 'message') {
         return false;
@@ -208,7 +286,7 @@ private function tryFastSaveMessage(object $client, int|string $peer, array $ite
     }
 }
 
-private function tryReplyMessageToChat(int|string $peer, array $item, ?array $replyTo = null): bool {
+private function tryReplyMessageToChat(int|string $peer, array $item, ?array $replyTo = null, ?object $sourceClient = null): bool {
     if (($item['_'] ?? null) !== 'message') {
         return false;
     }
@@ -225,15 +303,28 @@ private function tryReplyMessageToChat(int|string $peer, array $item, ?array $re
         }
         return true;
     } catch (\Throwable $e) {
+        if ($sourceClient !== null && $media !== null) {
+            return $this->sendDownloadedMessageToChat($sourceClient, $peer, $item, $replyTo);
+        }
         return false;
     }
 }
 
-private function tryReplyAlbumToChat(int|string $peer, array $album, ?array $replyTo = null): bool {
+private function tryReplyAlbumToChat(int|string $peer, array $album, ?array $replyTo = null, ?object $sourceClient = null): bool {
     try {
         return $this->sendAlbumMessages($this, $peer, $album, $replyTo) > 0;
     } catch (\Throwable $e) {
-        return false;
+        if ($sourceClient === null) {
+            return false;
+        }
+
+        $sent = 0;
+        foreach ($album as $item) {
+            if ($this->tryReplyMessageToChat($peer, $item, $replyTo, $sourceClient)) {
+                $sent++;
+            }
+        }
+        return $sent > 0;
     }
 }
 
@@ -2556,7 +2647,7 @@ $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, me
 
 if(count($albumMessages) > 1){
 $sentMessagex = $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "Processing album... Please wait.");
-if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage)){
+if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto)){
 $this->messages->editMessage(peer: $senderid, id: $this->extractMessageId($sentMessagex), message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }
@@ -2565,7 +2656,7 @@ $VAR_SENT = true;
 return;
 }
 
-if(!$this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage)){
+if(!$this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage, $MadelineProto)){
 $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "<i>❌ This message cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }
@@ -2608,7 +2699,7 @@ $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, me
 
 if(count($albumMessages) > 1){
 $sentMessagex = $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "Processing album... Please wait.");
-if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage)){
+if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto)){
 $this->messages->editMessage(peer: $senderid, id: $this->extractMessageId($sentMessagex), message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }
@@ -2617,7 +2708,7 @@ $VAR_SENT = true;
 return;
 }
 
-if($this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage)){
+if($this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage, $MadelineProto)){
 $VAR_SENT = true;
 return;
 }
@@ -6452,7 +6543,7 @@ $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, me
 
 if(count($albumMessages) > 1){
 $sentMessagex = $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "Processing album... Please wait.");
-if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage)){
+if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto)){
 $this->messages->editMessage(peer: $senderid, id: $this->extractMessageId($sentMessagex), message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }
@@ -6461,7 +6552,7 @@ $VAR_SENT = true;
 return;
 }
 
-if(!$this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage)){
+if(!$this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage, $MadelineProto)){
 $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "<i>❌ This message cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }
@@ -6494,16 +6585,30 @@ $type = 'channel';
 
 if($type == 'channel'){
 try {
-	
+
 $albumMessages = $this->fetchAlbumMessages($this, "$usernamex", $numbersx);
 if(count($albumMessages) > 1){
-$this->sendAlbumMessages($this, $message->senderId, $albumMessages, $inputReplyToMessage);
+if(!$this->tryReplyAlbumToChat($message->senderId, $albumMessages, $inputReplyToMessage, $this)){
+$this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
+return;
+}
+$VAR_SENT = true;
+return;
+	}
+	$messages_Messages = ['messages' => [$albumMessages[0] ?? []]];
+
+$msgvar = $messages_Messages['messages'][0] ?? [];
+    if (($msgvar['_'] ?? null) !== 'message') {
+$this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "<i>❌ MESSAGE_EMPTY</i>", parse_mode: 'HTML');
+    return;
+    }
+
+if($this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage, $this)){
 $VAR_SENT = true;
 return;
 }
-$messages_Messages = ['messages' => [$albumMessages[0] ?? []]];
 
-$messages_Messagesxtext = $messages_Messages['messages'][0]['message']?? null;
+	$messages_Messagesxtext = $messages_Messages['messages'][0]['message']?? null;
 if($messages_Messagesxtext == null){
 //$messages_Messagesxtext = "null";
 }
@@ -6602,7 +6707,7 @@ if($type != 'channel'){
 $albumMessages = $this->fetchAlbumMessages($MadelineProto, "$usernamex", $numbersx);
 if(count($albumMessages) > 1){
 $sentMessagex = $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "Processing album... Please wait.");
-if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage)){
+if(!$this->tryReplyAlbumToChat($senderid, $albumMessages, $inputReplyToMessage, $MadelineProto)){
 $this->messages->editMessage(peer: $senderid, id: $this->extractMessageId($sentMessagex), message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
 return;
 }
@@ -6618,7 +6723,7 @@ $this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, me
     return;
     }
 
-if($this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage)){
+if($this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage, $MadelineProto)){
 $VAR_SENT = true;
 return;
 }
@@ -8003,16 +8108,30 @@ $type = 'channel';
 
 if($type == 'channel'){
 try {
-	
+
 $albumMessages = $this->fetchAlbumMessages($this, "$usernamex", $numbersx);
 if(count($albumMessages) > 1){
-$this->sendAlbumMessages($this, $message->senderId, $albumMessages, $inputReplyToMessage);
+if(!$this->tryReplyAlbumToChat($message->senderId, $albumMessages, $inputReplyToMessage, $this)){
+$this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "<i>❌ This album cannot be sent directly in bot chat.</i>", parse_mode: 'HTML');
+return;
+}
+$VAR_SENT = true;
+return;
+	}
+	$messages_Messages = ['messages' => [$albumMessages[0] ?? []]];
+
+$msgvar = $messages_Messages['messages'][0] ?? [];
+    if (($msgvar['_'] ?? null) !== 'message') {
+$this->messages->sendMessage(peer: $senderid, reply_to: $inputReplyToMessage, message: "<i>❌ MESSAGE_EMPTY</i>", parse_mode: 'HTML');
+    return;
+    }
+
+if($this->tryReplyMessageToChat($senderid, $messages_Messages['messages'][0], $inputReplyToMessage, $this)){
 $VAR_SENT = true;
 return;
 }
-$messages_Messages = ['messages' => [$albumMessages[0] ?? []]];
 
-$messages_Messagesxtext = $messages_Messages['messages'][0]['message']?? null;
+	$messages_Messagesxtext = $messages_Messages['messages'][0]['message']?? null;
 if($messages_Messagesxtext == null){
 //$messages_Messagesxtext = "null";
 }

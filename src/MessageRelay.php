@@ -105,9 +105,14 @@ trait MessageRelay
 
         try {
             $albumMessages = $this->fetchAlbumMessages($relayClient, (string) $target['peer'], (int) $target['message_id']);
+            if (!$requiresUserSession && $hasUserSession && !$this->hasRelayableMessage($albumMessages)) {
+                $relayClient = $sourceClient;
+                $albumMessages = $this->fetchAlbumMessages($relayClient, (string) $target['peer'], (int) $target['message_id']);
+            }
+
             $firstMessage = $albumMessages[0] ?? null;
             if (($firstMessage['_'] ?? null) !== 'message') {
-                $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: "<i>❌ MESSAGE_EMPTY</i>", parse_mode: 'HTML');
+                $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: "<i>❌ MESSAGE_EMPTY</i>\nThe message was not returned by Telegram. If it is visible in your account, try /login or make sure the connected account can open the link.", parse_mode: 'HTML');
                 return true;
             }
 
@@ -168,6 +173,17 @@ trait MessageRelay
 
         usort($album, fn($a, $b) => ((int) ($a['id'] ?? 0)) <=> ((int) ($b['id'] ?? 0)));
         return $album ?: [$first];
+    }
+
+    private function hasRelayableMessage(array $messages): bool
+    {
+        foreach ($messages as $message) {
+            if (($message['_'] ?? null) === 'message') {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function fetchMessagesFromPeer(object $client, string $peer, array $ids): array

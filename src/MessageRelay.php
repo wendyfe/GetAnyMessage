@@ -100,8 +100,11 @@ trait MessageRelay
             return true;
         }
 
+        $requiresUserSession = (bool) ($target['requires_user_session'] ?? false);
+        $relayClient = $requiresUserSession ? $sourceClient : $this;
+
         try {
-            $albumMessages = $this->fetchAlbumMessages($sourceClient, (string) $target['peer'], (int) $target['message_id']);
+            $albumMessages = $this->fetchAlbumMessages($relayClient, (string) $target['peer'], (int) $target['message_id']);
             $firstMessage = $albumMessages[0] ?? null;
             if (($firstMessage['_'] ?? null) !== 'message') {
                 $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: "<i>❌ MESSAGE_EMPTY</i>", parse_mode: 'HTML');
@@ -111,7 +114,7 @@ trait MessageRelay
             if (count($albumMessages) > 1) {
                 $status = $this->messages->sendMessage(peer: $peer, reply_to: $replyTo, message: "Processing album... Please wait.");
                 $statusId = $this->extractMessageId($status);
-                if (!$this->tryReplyAlbumToChat($peer, $albumMessages, $replyTo, $sourceClient, $statusId)) {
+                if (!$this->tryReplyAlbumToChat($peer, $albumMessages, $replyTo, $relayClient, $statusId)) {
                     $this->editRelayStatus($peer, $statusId, self::RELAY_ALBUM_FAIL_MESSAGE);
                     return true;
                 }
@@ -126,7 +129,7 @@ trait MessageRelay
                 $statusId = $this->extractMessageId($status);
             }
 
-            if (!$this->tryReplyMessageToChat($peer, $firstMessage, $replyTo, $sourceClient, $statusId)) {
+            if (!$this->tryReplyMessageToChat($peer, $firstMessage, $replyTo, $relayClient, $statusId)) {
                 if ($statusId !== null) {
                     $this->editRelayStatus($peer, $statusId, self::RELAY_DIRECT_FAIL_MESSAGE);
                 } else {

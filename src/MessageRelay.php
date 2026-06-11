@@ -435,27 +435,6 @@ trait MessageRelay
         }
     }
 
-    private function tryFastSaveMessage(object $client, int|string $peer, array $item): bool
-    {
-        if (($item['_'] ?? null) !== 'message') {
-            return false;
-        }
-
-        try {
-            $text = (string) ($item['message'] ?? '');
-            $entities = $item['entities'] ?? null;
-            $media = $item['media'] ?? null;
-            if ($media !== null) {
-                $client->messages->sendMedia(peer: $peer, message: $text, entities: $entities, media: $media);
-            } else {
-                $client->messages->sendMessage(peer: $peer, message: $text, entities: $entities);
-            }
-            return true;
-        } catch (\Throwable $e) {
-            return false;
-        }
-    }
-
     private function tryReplyMessageToChat(int|string $peer, array $item, ?array $replyTo = null, ?object $sourceClient = null, ?int $statusMessageId = null): bool
     {
         if (($item['_'] ?? null) !== 'message') {
